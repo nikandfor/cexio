@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/buger/jsonparser"
@@ -29,18 +30,26 @@ type (
 		conn *websocket.Conn
 
 		c chan Event
+
+		mu   sync.Mutex
+		reqs map[string]*req
+	}
+
+	req struct {
+		ev   Event
+		errc chan error
 	}
 
 	Event struct {
 		Event string      `json:"e"`
 		OK    string      `json:"ok,omitempty"`
-		OID   string      `json:"oid,omitempty"`
+		ReqID string      `json:"oid,omitempty"`
 		Data  interface{} `json:"data,omitempty"`
 
 		raw []byte
 	}
 
-	Tick struct {
+	TickEvent struct {
 		Symbol1 string          `json:"symbol1"`
 		Symbol2 string          `json:"symbol2"`
 		Price   decimal.Decimal `json:"price"`
@@ -93,6 +102,30 @@ type (
 	}
 
 	hist History
+
+	Ticker struct {
+		Timestamp          int64           `json:"timestamp,omitempty,string"`
+		Low                decimal.Decimal `json:"low,omitempty"`
+		High               decimal.Decimal `json:"high,omitempty"`
+		Last               decimal.Decimal `json:"last,omitempty"`
+		Volume             decimal.Decimal `json:"volume,omitempty"`
+		Volume30d          decimal.Decimal `json:"volume30d,omitempty"`
+		Bid                decimal.Decimal `json:"bid,omitempty"`
+		Ask                decimal.Decimal `json:"ask,omitempty"`
+		PriceChange        decimal.Decimal `json:"priceChange,omitempty"`
+		PriceChangePercent decimal.Decimal `json:"priceChangePercentage,omitempty"`
+
+		Pair []string `json:"pair,omitempty"`
+
+		Symbol1 string `json:"-"`
+		Symbol2 string `json:"-"`
+	}
+
+	Balance struct {
+		Balances      map[string]decimal.Decimal `json:"balance"`
+		OrderBalances map[string]decimal.Decimal `json:"obalance"`
+		Timestamp     int64                      `json:"time,omitempty"`
+	}
 )
 
 func newWS(key string, secret []byte) *Websocket {
@@ -101,6 +134,7 @@ func newWS(key string, secret []byte) *Websocket {
 		key:    key,
 		secret: secret,
 		c:      make(chan Event),
+		reqs:   make(map[string]*req),
 	}
 }
 
@@ -108,16 +142,53 @@ func (ws *Websocket) Events() <-chan Event {
 	return ws.c
 }
 
+// Subscribe subscribes to "tickers" (trades) or "pair-A-B" where A and B are BTC, ETH, USD and so on.
 func (ws *Websocket) Subscribe(tickers []string) (err error) {
-	err = ws.conn.WriteJSON(map[string]interface{}{
+	return ws.send(map[string]interface{}{
 		"e":     "subscribe",
 		"rooms": tickers,
 	})
+}
+
+func (ws *Websocket) Ticker(s1, s2 string) (ev Event, err error) {
+	return ws.req(Event{Event: "ticker", Data: []string{s1, s2}})
+}
+
+func (ws *Websocket) GetBalance() (ev Event, err error) {
+	return ws.req(Event{Event: "get-balance"})
+}
+
+func (ws *Websocket) req(m Event) (ev Event, err error) {
+	t := time.Now()
+	reqid := fmt.Sprintf("%d", t.UnixNano())
+
+	// TODO
+	r := &req{
+		errc: make(chan error, 1),
+	}
+	ws.reqs[reqid] = r
+
+	defer func() {
+		delete(ws.reqs, reqid)
+	}()
+
+	m.ReqID = reqid
+
+	err = ws.send(m)
 	if err != nil {
-		return errors.Wrap(err, "write")
+		return ev, errors.Wrap(err, "send")
 	}
 
-	return nil
+	err = <-r.errc
+	if err != nil {
+		return ev, errors.Wrap(err, "response")
+	}
+
+	return r.ev, nil
+}
+
+func (ws *Websocket) send(m interface{}) (err error) {
+	return ws.conn.WriteJSON(m)
 }
 
 func (ws *Websocket) connect(ctx context.Context) (err error) {
@@ -151,6 +222,16 @@ func (ws *Websocket) connect(ctx context.Context) (err error) {
 		return errors.Wrap(err, "write auth")
 	}
 
+	ev, err := ws.readEvent(ws.conn)
+	if err != nil {
+		return errors.Wrap(err, "read auth response")
+	}
+
+	err = ws.handleAuth(ev)
+	if err != nil {
+		return errors.Wrap(err, "auth")
+	}
+
 	go func() {
 		err := ws.reader(ws.conn)
 		if err != nil {
@@ -163,96 +244,106 @@ func (ws *Websocket) connect(ctx context.Context) (err error) {
 
 func (ws *Websocket) reader(c *websocket.Conn) (err error) {
 	for {
-		var tp int
-		var p []byte
-
-		tp, p, err = c.ReadMessage()
-		if err != nil {
-			return errors.Wrap(err, "read")
-		}
-
-		tlog.V("raw").Printw("message", "tp", tp, "msg", p)
-
-		if tp != websocket.TextMessage {
-			return errors.New("not a text message: %x", tp)
-		}
-
-		var ev Event
-		ev.raw = p
-
-		err = json.Unmarshal(p, &ev)
-		if err != nil {
-			return errors.Wrap(err, "decode e")
-		}
-
-		switch ev.Event {
-		//	case "connected":
-		case "disconnecting":
-			return errors.New("disconnected: %v", "") //, r.Reason)
-		case "ping":
-			// TODO
-			//	err = c.WriteJSON(struct {
-			//		E string `json:"e"`
-			//	}{E: "pong"})
-			if err != nil {
-				err = errors.Wrap(err, "write pong")
-			}
-		case "auth":
-			err = ws.handleAuth(ev, p)
-		case "tick":
-			err = ws.handleTick(ev, p)
-		case "ohlcv24":
-			err = ws.handleOHLCV(ev, p)
-		case "md":
-			err = ws.handleMD(ev, p)
-		case "md_groupped":
-			err = ws.handleMDGrouped(ev, p)
-		case "history":
-			err = ws.handleHistory(ev, p)
-		case "history-update":
-			err = ws.handleHistoryUpdate(ev, p)
-		default:
-			//	tlog.Printw("msg", "e", ev.Event)
-			ws.c <- ev
-		}
-
+		ev, err := ws.readEvent(c)
 		if err != nil {
 			return err
 		}
+
+		if ev.ReqID != "" {
+			r := ws.reqs[ev.ReqID]
+
+			r.ev = ev
+			r.errc <- err
+
+			continue
+		}
+
+		ws.c <- ev
 	}
 }
 
-func (ws *Websocket) handleTick(ev Event, p []byte) (err error) {
-	ev.Data = &Tick{}
+func (ws *Websocket) readEvent(c *websocket.Conn) (ev Event, err error) {
+	var tp int
+	var p []byte
+
+	tp, p, err = c.ReadMessage()
+	if err != nil {
+		return ev, errors.Wrap(err, "read")
+	}
+
+	tlog.V("raw").Printw("message", "tp", tp, "msg", p)
+
+	ev.raw = p
+
+	if tp != websocket.TextMessage {
+		return ev, errors.New("not a text message: %x", tp)
+	}
 
 	err = json.Unmarshal(p, &ev)
+	if err != nil {
+		return ev, errors.Wrap(err, "decode e")
+	}
+
+	switch ev.Event {
+	//	case "connected":
+	case "disconnecting":
+		return ev, errors.New("disconnected: %v", "") //, r.Reason)
+	case "ping":
+		// TODO
+		//	err = c.WriteJSON(struct {
+		//		E string `json:"e"`
+		//	}{E: "pong"})
+		if err != nil {
+			err = errors.Wrap(err, "write pong")
+		}
+	case "tick":
+		err = ws.parseTick(&ev, p)
+	case "ohlcv24":
+		err = ws.parseOHLCV(&ev, p)
+	case "md":
+		err = ws.parseMD(&ev, p)
+	case "md_groupped":
+		err = ws.parseMDGrouped(&ev, p)
+	case "history":
+		err = ws.parseHistory(&ev, p)
+	case "history-update":
+		err = ws.parseHistoryUpdate(&ev, p)
+	case "ticker":
+		err = ws.parseTicker(&ev, p)
+	case "get-balance":
+		err = ws.parseBalance(&ev, p)
+	}
+
+	return
+}
+
+func (ws *Websocket) parseTick(ev *Event, p []byte) (err error) {
+	ev.Data = &TickEvent{}
+
+	err = json.Unmarshal(p, ev)
 	if err != nil {
 		return errors.Wrap(err, "unmarshal data")
 	}
 
-	ws.c <- ev
-
 	return nil
 }
 
-func (ws *Websocket) handleOHLCV(ev Event, p []byte) (err error) {
+func (ws *Websocket) parseOHLCV(ev *Event, p []byte) (err error) {
 	q := &ohlcv24{}
 
 	ev.Data = q
 
-	err = json.Unmarshal(p, &ev)
+	err = json.Unmarshal(p, ev)
 	if err != nil {
 		return errors.Wrap(err, "unmarshal data")
 	}
 
 	ev.Data = (*OHLCV24)(q)
 
-	ws.c <- ev
-
 	return nil
 }
 
-func (ws *Websocket) handleMD(ev Event, p []byte) (err error) {
+func (ws *Websocket) parseMD(ev *Event, p []byte) (err error) {
 	type qtp struct {
 		ID        float64         `json:"id"`
 		Pair      string          `json:"pair"`
@@ -265,7 +356,7 @@ func (ws *Websocket) handleMD(ev Event, p []byte) (err error) {
 	q := &qtp{}
 	ev.Data = q
 
-	err = json.Unmarshal(p, &ev)
+	err = json.Unmarshal(p, ev)
 	if err != nil {
 		return errors.Wrap(err, "unmarshal data")
 	}
@@ -293,12 +384,10 @@ func (ws *Websocket) handleMD(ev Event, p []byte) (err error) {
 
 	ev.Data = md
 
-	ws.c <- ev
-
 	return nil
 }
 
-func (ws *Websocket) handleMDGrouped(ev Event, p []byte) (err error) {
+func (ws *Websocket) parseMDGrouped(ev *Event, p []byte) (err error) {
 	type q struct {
 		ID   int64                               `json:"id"`
 		Pair string                              `json:"pair"`
@@ -309,7 +398,7 @@ func (ws *Websocket) handleMDGrouped(ev Event, p []byte) (err error) {
 	md := &q{}
 	ev.Data = md
 
-	err = json.Unmarshal(p, &ev)
+	err = json.Unmarshal(p, ev)
 	if err != nil {
 		return errors.Wrap(err, "unmarshal data")
 	}
@@ -350,49 +439,74 @@ func (ws *Websocket) handleMDGrouped(ev Event, p []byte) (err error) {
 
 	ev.Data = conv
 
-	ws.c <- ev
-
 	return nil
 }
 
-func (ws *Websocket) handleHistory(ev Event, p []byte) (err error) {
+func (ws *Websocket) parseHistory(ev *Event, p []byte) (err error) {
 	h := &hist{}
 	ev.Data = &h
 
-	err = json.Unmarshal(p, &ev)
+	err = json.Unmarshal(p, ev)
 	if err != nil {
 		return errors.Wrap(err, "unmarshal data")
 	}
 
 	ev.Data = (*History)(h)
 
-	ws.c <- ev
-
 	return nil
 }
 
-func (ws *Websocket) handleHistoryUpdate(ev Event, p []byte) (err error) {
+func (ws *Websocket) parseHistoryUpdate(ev *Event, p []byte) (err error) {
 	h := &hist{}
 	ev.Data = &h
 
-	err = json.Unmarshal(p, &ev)
+	err = json.Unmarshal(p, ev)
 	if err != nil {
 		return errors.Wrap(err, "unmarshal data")
 	}
 
 	ev.Data = (*History)(h)
 
-	ws.c <- ev
+	return nil
+}
+
+func (ws *Websocket) parseTicker(ev *Event, p []byte) (err error) {
+	q := &Ticker{}
+	ev.Data = q
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	q.Timestamp *= int64(time.Second)
+
+	q.Symbol1 = q.Pair[0]
+	q.Symbol2 = q.Pair[1]
 
 	return nil
 }
 
-func (ws *Websocket) handleAuth(ev Event, p []byte) (err error) {
+func (ws *Websocket) parseBalance(ev *Event, p []byte) (err error) {
+	q := &Balance{}
+	ev.Data = q
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	q.Timestamp *= int64(time.Millisecond)
+
+	return nil
+}
+
+func (ws *Websocket) handleAuth(ev Event) (err error) {
 	if e := ev.Data.(map[string]interface{})["error"]; e != nil {
-		return errors.New("auth: %v", e)
+		return errors.New("%v", e)
 	}
 	if ev.OK != "ok" {
-		return errors.New("auth: not ok: %s", p)
+		return errors.New("not ok: %s", ev.Raw())
 	}
 
 	return nil

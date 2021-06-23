@@ -7,6 +7,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/nikandfor/cexio"
 	"github.com/nikandfor/cli"
@@ -28,9 +29,17 @@ func main() {
 			cli.NewFlag("debug", "", "debug addr to listen to", cli.Hidden),
 		},
 		Commands: []*cli.Command{{
-			Name:   "test",
-			Action: test,
+			Name:   "subscribe",
+			Action: subscribe,
 			Args:   cli.Args{},
+		}, {
+			Name:   "tick,ticker",
+			Usage:  "<sym1> <sym2>",
+			Action: ticker,
+			Args:   cli.Args{},
+		}, {
+			Name:   "balance",
+			Action: balance,
 		}},
 	}
 
@@ -67,7 +76,7 @@ func before(c *cli.Command) error {
 	return nil
 }
 
-func test(c *cli.Command) (err error) {
+func subscribe(c *cli.Command) (err error) {
 	cl, err := cexio.New(c.String("key"), []byte(c.String("secret")))
 	if err != nil {
 		return errors.Wrap(err, "new client")
@@ -91,7 +100,7 @@ func test(c *cli.Command) (err error) {
 		tlog.Printw("event", "data_type", tlog.FormatNext("%T"), ev.Data, "event", ev)
 
 		switch ev.Data.(type) {
-		case *cexio.Tick:
+		case *cexio.TickEvent:
 		case *cexio.MarketData:
 		case *cexio.History:
 		case *cexio.OHLCV24:
@@ -99,6 +108,52 @@ func test(c *cli.Command) (err error) {
 			panic(fmt.Sprintf("%T", ev.Data))
 		}
 	}
+
+	return nil
+}
+
+func ticker(c *cli.Command) (err error) {
+	cl, err := cexio.New(c.String("key"), []byte(c.String("secret")))
+	if err != nil {
+		return errors.Wrap(err, "new client")
+	}
+
+	ws, err := cl.Websocket(context.Background())
+	if err != nil {
+		return errors.Wrap(err, "open websocket")
+	}
+
+	ev, err := ws.Ticker(c.Args[0], c.Args[1])
+	if err != nil {
+		return errors.Wrap(err, "request")
+	}
+
+	t := ev.Data.(*cexio.Ticker)
+
+	tlog.Printw("ticker", "ticker", t, "ts", time.Unix(0, t.Timestamp))
+
+	return nil
+}
+
+func balance(c *cli.Command) (err error) {
+	cl, err := cexio.New(c.String("key"), []byte(c.String("secret")))
+	if err != nil {
+		return errors.Wrap(err, "new client")
+	}
+
+	ws, err := cl.Websocket(context.Background())
+	if err != nil {
+		return errors.Wrap(err, "open websocket")
+	}
+
+	ev, err := ws.GetBalance()
+	if err != nil {
+		return errors.Wrap(err, "request")
+	}
+
+	b := ev.Data.(*cexio.Balance)
+
+	tlog.Printw("balance", "balances", b.Balances, "order_balances", b.OrderBalances, "ts", time.Unix(0, b.Timestamp))
 
 	return nil
 }
