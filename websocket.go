@@ -70,6 +70,7 @@ type (
 
 	MarketData struct {
 		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
 		Pair      string          `json:"pair"`
 		BuyTotal  decimal.Decimal `json:"buy_total"`
 		SellTotal decimal.Decimal `json:"sell_total"`
@@ -126,6 +127,43 @@ type (
 		OrderBalances map[string]decimal.Decimal `json:"obalance"`
 		Timestamp     int64                      `json:"time,omitempty"`
 	}
+
+	Order struct {
+		Action string          `json:"act"`
+		Pair   string          `json:"pair"`
+		Price  decimal.Decimal `json:"price"`
+		Amount decimal.Decimal `json:"amount"`
+	}
+
+	order Order
+
+	OrderStatus struct {
+		ID        string          `json:"id"`
+		Action    string          `json:"act"`
+		Time      int64           `json:"time"`
+		Price     decimal.Decimal `json:"price"`
+		Amount    decimal.Decimal `json:"amount"`
+		Pending   decimal.Decimal `json:"pending"`
+		Completed bool            `json:"complete"`
+	}
+
+	orderStatus OrderStatus
+
+	OrderCancelled struct {
+		ID   string `json:"id"`
+		Time int64  `json:"time"`
+	}
+
+	orderCancelled OrderCancelled
+
+	Error struct {
+		Err string `json:"error"`
+	}
+)
+
+const (
+	Buy  = "buy"
+	Sell = "sell"
 )
 
 func newWS(key string, secret []byte) *Websocket {
@@ -143,7 +181,7 @@ func (ws *Websocket) Events() <-chan Event {
 }
 
 // Subscribe subscribes to "tickers" (trades) or "pair-A-B" where A and B are BTC, ETH, USD and so on.
-func (ws *Websocket) Subscribe(tickers []string) (err error) {
+func (ws *Websocket) SubscribePublic(tickers []string) (err error) {
 	return ws.send(map[string]interface{}{
 		"e":     "subscribe",
 		"rooms": tickers,
@@ -158,11 +196,49 @@ func (ws *Websocket) GetBalance() (ev Event, err error) {
 	return ws.req(Event{Event: "get-balance"})
 }
 
+func (ws *Websocket) SubscribeOrderbook(sym1, sym2 string) (err error) {
+	return ws.send(Event{
+		Event: "order-book-subscribe",
+		Data: map[string]interface{}{
+			"pair":      []string{sym1, sym2},
+			"subscribe": true,
+			"depth":     -1,
+		},
+		ReqID: fmt.Sprintf("obs_%d", time.Now().UnixNano()),
+	})
+}
+
+func (ws *Websocket) Orders(sym1, sym2 string) (ev Event, err error) {
+	return ws.req(Event{
+		Event: "open-orders",
+		Data: map[string]interface{}{
+			"pair": []string{sym1, sym2},
+		},
+	})
+}
+
+func (ws *Websocket) PlaceOrder(o Order) (ev Event, err error) {
+	return ws.req(Event{
+		Event: "place-order",
+		Data:  order(o),
+	})
+}
+
+func (ws *Websocket) CancelOrder(id string) (ev Event, err error) {
+	return ws.req(Event{
+		Event: "cancel-order",
+		Data: struct {
+			OrderID string `json:"order_id"`
+		}{
+			OrderID: id,
+		},
+	})
+}
+
 func (ws *Websocket) req(m Event) (ev Event, err error) {
 	t := time.Now()
 	reqid := fmt.Sprintf("%d", t.UnixNano())
 
-	// TODO
 	r := &req{
 		errc: make(chan error, 1),
 	}
@@ -184,7 +260,13 @@ func (ws *Websocket) req(m Event) (ev Event, err error) {
 		return ev, errors.Wrap(err, "response")
 	}
 
-	return r.ev, nil
+	ev = r.ev
+
+	if err, _ = ev.Data.(error); err != nil {
+		return ev, err
+	}
+
+	return ev, nil
 }
 
 func (ws *Websocket) send(m interface{}) (err error) {
@@ -249,13 +331,25 @@ func (ws *Websocket) reader(c *websocket.Conn) (err error) {
 			return err
 		}
 
-		if ev.ReqID != "" {
-			r := ws.reqs[ev.ReqID]
-
-			r.ev = ev
-			r.errc <- err
+		switch ev.Event {
+		case "ping":
+			err = c.WriteJSON(Event{Event: "pong"})
+			if err != nil {
+				return errors.Wrap(err, "write pong")
+			}
 
 			continue
+		}
+
+		if ev.ReqID != "" {
+			r, ok := ws.reqs[ev.ReqID]
+
+			if ok {
+				r.ev = ev
+				r.errc <- err
+
+				continue
+			}
 		}
 
 		ws.c <- ev
@@ -284,18 +378,16 @@ func (ws *Websocket) readEvent(c *websocket.Conn) (ev Event, err error) {
 		return ev, errors.Wrap(err, "decode e")
 	}
 
+	if ev.OK == "error" {
+		err = ws.parseError(&ev, p)
+		return
+	}
+
 	switch ev.Event {
 	//	case "connected":
 	case "disconnecting":
 		return ev, errors.New("disconnected: %v", "") //, r.Reason)
 	case "ping":
-		// TODO
-		//	err = c.WriteJSON(struct {
-		//		E string `json:"e"`
-		//	}{E: "pong"})
-		if err != nil {
-			err = errors.Wrap(err, "write pong")
-		}
 	case "tick":
 		err = ws.parseTick(&ev, p)
 	case "ohlcv24":
@@ -312,6 +404,14 @@ func (ws *Websocket) readEvent(c *websocket.Conn) (ev Event, err error) {
 		err = ws.parseTicker(&ev, p)
 	case "get-balance":
 		err = ws.parseBalance(&ev, p)
+	case "order-book-subscribe", "md_update":
+		err = ws.parseOrderbook(&ev, p)
+	case "open-orders":
+		err = ws.parseListOrders(&ev, p)
+	case "place-order":
+		err = ws.parsePlaceOrder(&ev, p)
+	case "cancel-order":
+		err = ws.parseCancelOrder(&ev, p)
 	}
 
 	return
@@ -501,6 +601,120 @@ func (ws *Websocket) parseBalance(ev *Event, p []byte) (err error) {
 	return nil
 }
 
+func (ws *Websocket) parseOrderbook(ev *Event, p []byte) (err error) {
+	type qtp struct {
+		Time      int64           `json:"time"`
+		Timestamp int64           `json:"timestamp"`
+		ID        int64           `json:"id"`
+		Pair      string          `json:"pair"`
+		Bids      []priceLevel    `json:"bids"`
+		Asks      []priceLevel    `json:"asks"`
+		BuyTotal  decimal.Decimal `json:"buy_total"`
+		SellTotal decimal.Decimal `json:"sell_total"`
+	}
+
+	q := &qtp{}
+	ev.Data = q
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	sym := strings.SplitN(q.Pair, ":", 2)
+
+	md := &MarketData{
+		Timestamp: q.Timestamp,
+		ID:        int64(q.ID),
+		Pair:      q.Pair,
+		BuyTotal:  q.BuyTotal,
+		SellTotal: q.SellTotal,
+		Symbol1:   sym[0],
+		Symbol2:   sym[1],
+	}
+
+	if md.Timestamp == 0 {
+		md.Timestamp = q.Time
+	}
+
+	md.Buy = make([]PriceLevel, len(q.Bids))
+	for i, l := range q.Bids {
+		md.Buy[i] = (PriceLevel)(l)
+	}
+
+	md.Sell = make([]PriceLevel, len(q.Asks))
+	for i, l := range q.Asks {
+		md.Sell[i] = (PriceLevel)(l)
+	}
+
+	ev.Data = md
+
+	return nil
+}
+
+func (ws *Websocket) parseListOrders(ev *Event, p []byte) (err error) {
+	var q []orderStatus
+	ev.Data = &q
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	list := make([]OrderStatus, len(q))
+
+	for i, up := range q {
+		list[i] = OrderStatus{
+			ID:        up.ID,
+			Action:    up.Action,
+			Time:      up.Time,
+			Price:     up.Price,
+			Amount:    up.Amount,
+			Pending:   up.Pending,
+			Completed: up.Completed,
+		}
+	}
+
+	ev.Data = list
+
+	return nil
+}
+
+func (ws *Websocket) parsePlaceOrder(ev *Event, p []byte) (err error) {
+	var up OrderStatus
+	ev.Data = (*orderStatus)(&up)
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	return nil
+}
+
+func (ws *Websocket) parseCancelOrder(ev *Event, p []byte) (err error) {
+	var up OrderCancelled
+	ev.Data = (*orderCancelled)(&up)
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	return nil
+}
+
+func (ws *Websocket) parseError(ev *Event, p []byte) (err error) {
+	ev.Data = &Error{}
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	return nil
+}
+
 func (ws *Websocket) handleAuth(ev Event) (err error) {
 	if e := ev.Data.(map[string]interface{})["error"]; e != nil {
 		return errors.New("%v", e)
@@ -631,4 +845,135 @@ func (p *ohlcv24) UnmarshalJSON(data []byte) (err error) {
 	}
 
 	return nil
+}
+
+func (o *order) UnmarshalJSON(data []byte) (err error) {
+	var q struct {
+		Type   string          `json:"type"`
+		Pair   []string        `json:"pair"`
+		Price  decimal.Decimal `json:"price"`
+		Amount decimal.Decimal `json:"amount"`
+	}
+
+	err = json.Unmarshal(data, &q)
+	if err != nil {
+		return err
+	}
+
+	o.Action = q.Type
+	o.Pair = q.Pair[0] + ":" + q.Pair[1]
+	o.Price = q.Price
+	o.Amount = q.Amount
+
+	return nil
+}
+
+func (o order) MarshalJSON() (d []byte, err error) {
+	type q struct {
+		Type   string          `json:"type"`
+		Pair   []string        `json:"pair"`
+		Price  decimal.Decimal `json:"price"`
+		Amount decimal.Decimal `json:"amount"`
+	}
+
+	s1, s2, err := pair(o.Pair)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse pair")
+	}
+
+	return json.Marshal(q{
+		Type:   o.Action,
+		Pair:   []string{s1, s2},
+		Price:  o.Price,
+		Amount: o.Amount,
+	})
+}
+
+func (up *orderStatus) UnmarshalJSON(data []byte) (err error) {
+	var q struct {
+		ID        string          `json:"id"`
+		Time      int64           `json:"time"`
+		Type      string          `json:"type"`
+		Price     decimal.Decimal `json:"price"`
+		Amount    decimal.Decimal `json:"amount"`
+		Pending   decimal.Decimal `json:"pending"`
+		Completed bool            `json:"complete"`
+	}
+
+	err = json.Unmarshal(data, &q)
+	if err != nil {
+		return err
+	}
+
+	up.ID = q.ID
+	up.Time = q.Time
+	up.Action = q.Type
+	up.Price = q.Price
+	up.Amount = q.Amount
+	up.Pending = q.Pending
+	up.Completed = q.Completed
+
+	return nil
+}
+
+func (up orderStatus) MarshalJSON() (d []byte, err error) {
+	type q struct {
+		ID        string          `json:"id"`
+		Time      int64           `json:"time"`
+		Type      string          `json:"type"`
+		Price     decimal.Decimal `json:"price"`
+		Amount    decimal.Decimal `json:"amount"`
+		Pending   decimal.Decimal `json:"pending"`
+		Completed bool            `json:"complete"`
+	}
+
+	return json.Marshal(q{
+		ID:        up.ID,
+		Type:      up.Action,
+		Time:      up.Time,
+		Price:     up.Price,
+		Amount:    up.Amount,
+		Pending:   up.Pending,
+		Completed: up.Completed,
+	})
+}
+
+func (up *orderCancelled) UnmarshalJSON(data []byte) (err error) {
+	var q struct {
+		ID   string `json:"id"`
+		Time int64  `json:"time"`
+	}
+
+	err = json.Unmarshal(data, &q)
+	if err != nil {
+		return err
+	}
+
+	up.ID = q.ID
+	up.Time = q.Time * int64(time.Millisecond)
+
+	return nil
+}
+
+func (up orderCancelled) MarshalJSON() (d []byte, err error) {
+	type q struct {
+		ID   string `json:"id"`
+		Time int64  `json:"time"`
+	}
+
+	return json.Marshal(q{
+		ID:   up.ID,
+		Time: up.Time / int64(time.Millisecond),
+	})
+}
+
+func (e *Error) Error() string { return e.Err }
+
+func pair(t string) (s1, s2 string, err error) {
+	p := strings.Index(t, ":")
+	if p == -1 {
+		return "", "", errors.New("marlormed pair")
+	}
+
+	return t[:p], t[p+1:], nil
 }

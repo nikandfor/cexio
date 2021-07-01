@@ -7,6 +7,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/nikandfor/cexio"
@@ -14,6 +15,7 @@ import (
 	"github.com/nikandfor/errors"
 	"github.com/nikandfor/tlog"
 	"github.com/nikandfor/tlog/ext/tlflag"
+	"github.com/shopspring/decimal"
 )
 
 func main() {
@@ -24,22 +26,40 @@ func main() {
 			cli.NewFlag("key", "", "api key"),
 			cli.NewFlag("secret", "", "api key secret"),
 
+			cli.NewFlag("pair", "BTC:USD", "pair"),
+
 			cli.NewFlag("log", "stderr+dm", "log destination"),
 			cli.NewFlag("v", "", "verbosity topics"),
 			cli.NewFlag("debug", "", "debug addr to listen to", cli.Hidden),
+
+			cli.FlagfileFlag,
+			cli.HelpFlag,
 		},
 		Commands: []*cli.Command{{
-			Name:   "subscribe",
+			Name:   "public",
 			Action: subscribe,
 			Args:   cli.Args{},
 		}, {
 			Name:   "tick,ticker",
-			Usage:  "<sym1> <sym2>",
 			Action: ticker,
-			Args:   cli.Args{},
 		}, {
 			Name:   "balance",
 			Action: balance,
+		}, {
+			Name:   "orderbook",
+			Action: orderbook,
+		}, {
+			Name:   "order",
+			Action: orders,
+			Commands: []*cli.Command{{
+				Name:   "place,new,add",
+				Action: orderPlace,
+				Flags: []*cli.Flag{
+					cli.NewFlag("action", "", "buy|sell"),
+					cli.NewFlag("price", "", ""),
+					cli.NewFlag("amount", "", ""),
+				},
+			}},
 		}},
 	}
 
@@ -87,7 +107,7 @@ func subscribe(c *cli.Command) (err error) {
 		return errors.Wrap(err, "open websocket")
 	}
 
-	err = ws.Subscribe(c.Args)
+	err = ws.SubscribePublic(c.Args)
 	if err != nil {
 		return errors.Wrap(err, "subscribe")
 	}
@@ -123,7 +143,7 @@ func ticker(c *cli.Command) (err error) {
 		return errors.Wrap(err, "open websocket")
 	}
 
-	ev, err := ws.Ticker(c.Args[0], c.Args[1])
+	ev, err := ws.Ticker(pair(c.String("pair")))
 	if err != nil {
 		return errors.Wrap(err, "request")
 	}
@@ -153,7 +173,131 @@ func balance(c *cli.Command) (err error) {
 
 	b := ev.Data.(*cexio.Balance)
 
-	tlog.Printw("balance", "balances", b.Balances, "order_balances", b.OrderBalances, "ts", time.Unix(0, b.Timestamp))
+	nonzero := map[string]decimal.Decimal{}
+	for t, a := range b.Balances {
+		if a.IsZero() {
+			continue
+		}
+
+		nonzero[t] = a
+	}
+
+	ononzero := map[string]decimal.Decimal{}
+	for t, a := range b.OrderBalances {
+		if a.IsZero() {
+			continue
+		}
+
+		ononzero[t] = a
+	}
+
+	tlog.Printw("balance", "balances", nonzero, "order_balances", ononzero, "ts", time.Unix(0, b.Timestamp))
 
 	return nil
+}
+
+func orderbook(c *cli.Command) (err error) {
+	cl, err := cexio.New(c.String("key"), []byte(c.String("secret")))
+	if err != nil {
+		return errors.Wrap(err, "new client")
+	}
+
+	ws, err := cl.Websocket(context.Background())
+	if err != nil {
+		return errors.Wrap(err, "open websocket")
+	}
+
+	err = ws.SubscribeOrderbook(pair(c.String("pair")))
+	if err != nil {
+		return errors.Wrap(err, "subscribe")
+	}
+
+	evs := ws.Events()
+
+	for {
+		ev := <-evs
+
+		tlog.Printw("event", "data_type", tlog.FormatNext("%T"), ev.Data, "event", ev)
+
+		switch ev.Data.(type) {
+		case *cexio.MarketData:
+		default:
+			panic(fmt.Sprintf("%T", ev.Data))
+		}
+	}
+
+	return nil
+}
+
+func orders(c *cli.Command) (err error) {
+	cl, err := cexio.New(c.String("key"), []byte(c.String("secret")))
+	if err != nil {
+		return errors.Wrap(err, "new client")
+	}
+
+	ws, err := cl.Websocket(context.Background())
+	if err != nil {
+		return errors.Wrap(err, "open websocket")
+	}
+
+	ev, err := ws.Orders(pair(c.String("pair")))
+	if err != nil {
+		return errors.Wrap(err, "request")
+	}
+
+	l := ev.Data.([]cexio.OrderStatus)
+
+	for i, o := range l {
+		tlog.Printw("open orders", "idx", i, "order", o)
+	}
+
+	if len(l) == 0 {
+		tlog.Printw("no open orders")
+	}
+
+	return nil
+}
+
+func orderPlace(c *cli.Command) (err error) {
+	cl, err := cexio.New(c.String("key"), []byte(c.String("secret")))
+	if err != nil {
+		return errors.Wrap(err, "new client")
+	}
+
+	ws, err := cl.Websocket(context.Background())
+	if err != nil {
+		return errors.Wrap(err, "open websocket")
+	}
+
+	o := cexio.Order{
+		Action: c.String("action"),
+		Pair:   c.String("pair"),
+	}
+
+	err = o.Price.UnmarshalText([]byte(c.String("price")))
+	if err != nil {
+		return errors.Wrap(err, "price")
+	}
+
+	err = o.Amount.UnmarshalText([]byte(c.String("amount")))
+	if err != nil {
+		return errors.Wrap(err, "amount")
+	}
+
+	ev, err := ws.PlaceOrder(o)
+	if err != nil {
+		return errors.Wrap(err, "request")
+	}
+
+	b := ev.Data.(*cexio.Balance)
+
+	tlog.Printw("place order", "balances", b.Balances, "order_balances", b.OrderBalances, "ts", time.Unix(0, b.Timestamp))
+
+	return nil
+}
+
+func pair(t string) (s1, s2 string) {
+	p := strings.Index(t, ":")
+
+	return t[:p], t[p+1:]
 }
