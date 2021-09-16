@@ -117,7 +117,11 @@ func subscribe(c *cli.Command) (err error) {
 	for {
 		ev := <-evs
 
-		tlog.Printw("event", "data_type", tlog.FormatNext("%T"), ev.Data, "event", ev)
+		if tlog.If("include") && tlog.If(ev.Event) ||
+			tlog.If("exclude") && !tlog.If(ev.Event) ||
+			!tlog.If("include") && !tlog.If("exclude") {
+			tlog.Printw("event", "data_type", tlog.FormatNext("%T"), ev.Data, "event", ev)
+		}
 
 		switch ev.Data.(type) {
 		case *cexio.TickEvent:
@@ -220,7 +224,7 @@ func orderbook(c *cli.Command) (err error) {
 		tlog.Printw("event", "data_type", tlog.FormatNext("%T"), ev.Data, "event", ev)
 
 		switch ev.Data.(type) {
-		case *cexio.MarketData:
+		case *cexio.MarketDataUpdate:
 		default:
 			panic(fmt.Sprintf("%T", ev.Data))
 		}

@@ -83,6 +83,21 @@ type (
 		Full bool `json:"-"`
 	}
 
+	MarketDataUpdate struct {
+		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
+		Pair      string          `json:"pair"`
+		BuyTotal  decimal.Decimal `json:"buy_total"`
+		SellTotal decimal.Decimal `json:"sell_total"`
+		Bids      []PriceLevel    `json:"bids"`
+		Asks      []PriceLevel    `json:"asks"`
+
+		Symbol1 string `json:"symbol1"`
+		Symbol2 string `json:"symbol2"`
+
+		Full bool `json:"-"`
+	}
+
 	PriceLevel struct {
 		Price  decimal.Decimal `json:"price"`
 		Volume decimal.Decimal `json:"volume"`
@@ -623,7 +638,7 @@ func (ws *Websocket) parseOrderbook(ev *Event, p []byte) (err error) {
 
 	sym := strings.SplitN(q.Pair, ":", 2)
 
-	md := &MarketData{
+	md := &MarketDataUpdate{
 		Timestamp: q.Timestamp,
 		ID:        int64(q.ID),
 		Pair:      q.Pair,
@@ -637,14 +652,14 @@ func (ws *Websocket) parseOrderbook(ev *Event, p []byte) (err error) {
 		md.Timestamp = q.Time
 	}
 
-	md.Buy = make([]PriceLevel, len(q.Bids))
+	md.Bids = make([]PriceLevel, len(q.Bids))
 	for i, l := range q.Bids {
-		md.Buy[i] = (PriceLevel)(l)
+		md.Bids[i] = (PriceLevel)(l)
 	}
 
-	md.Sell = make([]PriceLevel, len(q.Asks))
+	md.Asks = make([]PriceLevel, len(q.Asks))
 	for i, l := range q.Asks {
-		md.Sell[i] = (PriceLevel)(l)
+		md.Asks[i] = (PriceLevel)(l)
 	}
 
 	ev.Data = md
@@ -826,6 +841,10 @@ func (h *hist) UnmarshalJSON(data []byte) (err error) {
 	if err != nil {
 		return err
 	}
+
+	sort.Slice(h.Trades, func(i, j int) bool {
+		return h.Trades[i].Timestamp < h.Trades[j].Timestamp
+	})
 
 	return nil
 }
