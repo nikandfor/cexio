@@ -110,11 +110,11 @@ type (
 	}
 
 	Trade struct {
-		Action    string          `json:"act"`
-		Timestamp int64           `json:"ts"`
-		Amount    decimal.Decimal `json:"amount"`
-		Price     decimal.Decimal `json:"price"`
-		TxID      int64           `json:"tx_id"`
+		Action string          `json:"action"`
+		Time   int64           `json:"ts"`
+		Amount decimal.Decimal `json:"amount"`
+		Price  decimal.Decimal `json:"price"`
+		TxID   int64           `json:"tx_id"`
 	}
 
 	hist History
@@ -143,8 +143,13 @@ type (
 		Timestamp     int64                      `json:"time,omitempty"`
 	}
 
+	SymbolBalance struct {
+		Symbol  string          `json:"symbol"`
+		Balance decimal.Decimal `json:"balance"`
+	}
+
 	Order struct {
-		Action string          `json:"act"`
+		Action string          `json:"action"`
 		Pair   string          `json:"pair"`
 		Price  decimal.Decimal `json:"price"`
 		Amount decimal.Decimal `json:"amount"`
@@ -154,22 +159,43 @@ type (
 
 	OrderStatus struct {
 		ID        string          `json:"id"`
-		Action    string          `json:"act"`
+		Action    string          `json:"action"`
 		Time      int64           `json:"time"`
 		Price     decimal.Decimal `json:"price"`
 		Amount    decimal.Decimal `json:"amount"`
 		Pending   decimal.Decimal `json:"pending"`
+		Remains   decimal.Decimal `json:"remains"`
+		Symbol1   string          `json:"symbol1"`
+		Symbol2   string          `json:"symbol2"`
 		Completed bool            `json:"complete"`
+		Cancel    bool            `json:"cancel"`
 	}
 
 	orderStatus OrderStatus
 
 	OrderCancelled struct {
-		ID   string `json:"id"`
-		Time int64  `json:"time"`
+		ID      string          `json:"id"`
+		Time    int64           `json:"time"`
+		Remains decimal.Decimal `json:"remains"`
 	}
 
 	orderCancelled OrderCancelled
+
+	Tx struct {
+		ID        string          `json:"id"`
+		Action    string          `json:"action"`
+		Order     string          `json:"order"`
+		BuyOrder  string          `json:"buy_order"`
+		SellOrder string          `json:"sell_order"`
+		Time      int64           `json:"time"`
+		User      string          `json:"user"`
+		Price     decimal.Decimal `json:"price"`
+		Amount    decimal.Decimal `json:"amount"`
+		Balance   decimal.Decimal `json:"balance"`
+		Fee       decimal.Decimal `json:"fee"`
+		Symbol1   string          `json:"symbol1"`
+		Symbol2   string          `json:"symbol2"`
+	}
 
 	Error struct {
 		Err string `json:"error"`
@@ -285,6 +311,8 @@ func (ws *Websocket) req(m Event) (ev Event, err error) {
 }
 
 func (ws *Websocket) send(m interface{}) (err error) {
+	tlog.V("raw").Printw("request", "req", m)
+
 	return ws.conn.WriteJSON(m)
 }
 
@@ -332,7 +360,7 @@ func (ws *Websocket) connect(ctx context.Context) (err error) {
 	go func() {
 		err := ws.reader(ws.conn)
 		if err != nil {
-			tlog.Printw("websocket reader stopped", "err", err)
+			tlog.Printw("websocket reader stopped", "err", err, "err_full", tlog.FormatNext("%+v"), err)
 		}
 	}()
 
@@ -423,10 +451,22 @@ func (ws *Websocket) readEvent(c *websocket.Conn) (ev Event, err error) {
 		err = ws.parseOrderbook(&ev, p)
 	case "open-orders":
 		err = ws.parseListOrders(&ev, p)
-	case "place-order":
+	case "place-order", "order":
 		err = ws.parsePlaceOrder(&ev, p)
 	case "cancel-order":
 		err = ws.parseCancelOrder(&ev, p)
+	case "balance", "obalance":
+		ev.Data = &SymbolBalance{}
+
+		err = json.Unmarshal(p, &ev)
+	case "tx":
+		err = ws.parseTx(&ev, p)
+	default:
+		err = ws.dump(&ev, p)
+	}
+
+	if err != nil {
+		_ = ws.dump(&ev, p)
 	}
 
 	return
@@ -673,6 +713,7 @@ func (ws *Websocket) parseListOrders(ev *Event, p []byte) (err error) {
 
 	err = json.Unmarshal(p, ev)
 	if err != nil {
+		tlog.Printw("unmarshal", "obj_type", tlog.FormatNext("%T"), ev, "data_type", tlog.FormatNext("%T"), ev.Data)
 		return errors.Wrap(err, "unmarshal data")
 	}
 
@@ -704,6 +745,8 @@ func (ws *Websocket) parsePlaceOrder(ev *Event, p []byte) (err error) {
 		return errors.Wrap(err, "unmarshal data")
 	}
 
+	ev.Data = &up
+
 	return nil
 }
 
@@ -715,6 +758,66 @@ func (ws *Websocket) parseCancelOrder(ev *Event, p []byte) (err error) {
 	if err != nil {
 		return errors.Wrap(err, "unmarshal data")
 	}
+
+	ev.Data = &up
+
+	return nil
+}
+
+func (ws *Websocket) parseTx(ev *Event, p []byte) (err error) {
+	_ = ws.dump(ev, p)
+
+	var q struct {
+		ID      string          `json:"id"`
+		User    string          `json:"user"`
+		Symbol  string          `json:"symbol"`
+		Symbol2 string          `json:"symbol2"`
+		Type    string          `json:"type"`
+		Amount  decimal.Decimal `json:"amount"`
+		Price   decimal.Decimal `json:"price"`
+		Buy     uint64          `json:"buy"`
+		Sell    uint64          `json:"sell"`
+		Order   uint64          `json:"order"`
+		Time    time.Time       `json:"time"`
+		Balance decimal.Decimal `json:"balance"`
+		Fee     decimal.Decimal `json:"fee_amount"`
+	}
+
+	ev.Data = &q
+
+	err = json.Unmarshal(p, ev)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal data")
+	}
+
+	ev.Data = &Tx{
+		ID:        q.ID,
+		Action:    q.Type,
+		Order:     fmt.Sprintf("%v", q.Order),
+		BuyOrder:  fmt.Sprintf("%v", q.Buy),
+		SellOrder: fmt.Sprintf("%v", q.Sell),
+		Time:      q.Time.UnixNano(),
+		User:      q.User,
+		Price:     q.Price,
+		Amount:    q.Amount,
+		Balance:   q.Balance,
+		Fee:       q.Fee,
+		Symbol1:   q.Symbol,
+		Symbol2:   q.Symbol2,
+	}
+
+	return nil
+}
+
+func (ws *Websocket) dump(ev *Event, p []byte) (err error) {
+	var buf bytes.Buffer
+
+	err = json.Indent(&buf, p, "", "    ")
+	if err != nil {
+		return errors.Wrap(err, "indent")
+	}
+
+	tlog.Printf("event dump %v\n%s", ev.Event, buf.Bytes())
 
 	return nil
 }
@@ -810,13 +913,13 @@ func (h *hist) UnmarshalJSON(data []byte) (err error) {
 			Action: string(seg[0]),
 		}
 
-		t.Timestamp, err = strconv.ParseInt(string(seg[1]), 10, 64)
+		t.Time, err = strconv.ParseInt(string(seg[1]), 10, 64)
 		if err != nil {
 			err = errors.Wrap(err, "parse timestamp")
 			return
 		}
 
-		t.Timestamp *= int64(time.Millisecond)
+		t.Time *= int64(time.Millisecond)
 
 		err = t.Amount.UnmarshalJSON(seg[2])
 		if err != nil {
@@ -843,7 +946,7 @@ func (h *hist) UnmarshalJSON(data []byte) (err error) {
 	}
 
 	sort.Slice(h.Trades, func(i, j int) bool {
-		return h.Trades[i].Timestamp < h.Trades[j].Timestamp
+		return h.Trades[i].Time < h.Trades[j].Time
 	})
 
 	return nil
@@ -910,27 +1013,66 @@ func (o order) MarshalJSON() (d []byte, err error) {
 
 func (up *orderStatus) UnmarshalJSON(data []byte) (err error) {
 	var q struct {
-		ID        string          `json:"id"`
-		Time      int64           `json:"time"`
-		Type      string          `json:"type"`
-		Price     decimal.Decimal `json:"price"`
-		Amount    decimal.Decimal `json:"amount"`
-		Pending   decimal.Decimal `json:"pending"`
-		Completed bool            `json:"complete"`
+		ID      string          `json:"id"`
+		Time    interface{}     `json:"time"`
+		Type    string          `json:"type"`
+		Price   decimal.Decimal `json:"price"`
+		Amount  decimal.Decimal `json:"amount"`
+		Pending decimal.Decimal `json:"pending"`
+		Remains decimal.Decimal `json:"fremains"`
+		Pair    struct {
+			Sym1 string `json:"symbol1"`
+			Sym2 string `json:"symbol2"`
+		} `json:"pair"`
+		Completed bool `json:"complete"`
+		Cancel    bool `json:"cancel"`
 	}
 
-	err = json.Unmarshal(data, &q)
+	_, tp, _, err := jsonparser.Get(data, "time")
+	if errors.Is(err, jsonparser.KeyPathNotFoundError) {
+		err = nil
+	}
 	if err != nil {
 		return err
 	}
 
+	switch tp {
+	case jsonparser.String:
+		// ok
+	case jsonparser.Number:
+		q.Time = &up.Time
+	case jsonparser.NotExist:
+		q.Time = json.RawMessage{}
+	default:
+		return errors.New("unexpected time type: %v", tp)
+	}
+
+	err = json.Unmarshal(data, &q)
+	if err != nil {
+		return errors.Wrap(err, "unmarshal")
+	}
+
 	up.ID = q.ID
-	up.Time = q.Time
 	up.Action = q.Type
 	up.Price = q.Price
 	up.Amount = q.Amount
 	up.Pending = q.Pending
 	up.Completed = q.Completed
+	up.Cancel = q.Cancel
+	up.Remains = q.Remains
+	up.Symbol1 = q.Pair.Sym1
+	up.Symbol2 = q.Pair.Sym2
+
+	switch t := q.Time.(type) {
+	case string:
+		up.Time, err = strconv.ParseInt(t, 10, 64)
+	case *int64:
+	case json.RawMessage:
+	default:
+		return errors.New("unexpected time type: %T", t)
+	}
+
+	up.Time *= 1e6
 
 	return nil
 }
@@ -959,8 +1101,9 @@ func (up orderStatus) MarshalJSON() (d []byte, err error) {
 
 func (up *orderCancelled) UnmarshalJSON(data []byte) (err error) {
 	var q struct {
-		ID   string `json:"id"`
-		Time int64  `json:"time"`
+		ID       string          `json:"order_id"`
+		Time     int64           `json:"time"`
+		FRemains decimal.Decimal `json:"fremains"`
 	}
 
 	err = json.Unmarshal(data, &q)
@@ -970,19 +1113,22 @@ func (up *orderCancelled) UnmarshalJSON(data []byte) (err error) {
 
 	up.ID = q.ID
 	up.Time = q.Time * int64(time.Millisecond)
+	up.Remains = q.FRemains
 
 	return nil
 }
 
 func (up orderCancelled) MarshalJSON() (d []byte, err error) {
 	type q struct {
-		ID   string `json:"id"`
-		Time int64  `json:"time"`
+		ID       string          `json:"order_id"`
+		Time     int64           `json:"time"`
+		FRemains decimal.Decimal `json:"fremains"`
 	}
 
 	return json.Marshal(q{
-		ID:   up.ID,
-		Time: up.Time / int64(time.Millisecond),
+		ID:       up.ID,
+		Time:     up.Time / int64(time.Millisecond),
+		FRemains: up.Remains,
 	})
 }
 

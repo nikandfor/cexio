@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -59,6 +58,10 @@ func main() {
 					cli.NewFlag("price", "", ""),
 					cli.NewFlag("amount", "", ""),
 				},
+			}, {
+				Name:   "cancel",
+				Action: orderCancel,
+				Args:   cli.Args{},
 			}},
 		}},
 	}
@@ -112,26 +115,7 @@ func subscribe(c *cli.Command) (err error) {
 		return errors.Wrap(err, "subscribe")
 	}
 
-	evs := ws.Events()
-
-	for {
-		ev := <-evs
-
-		if tlog.If("include") && tlog.If(ev.Event) ||
-			tlog.If("exclude") && !tlog.If(ev.Event) ||
-			!tlog.If("include") && !tlog.If("exclude") {
-			tlog.Printw("event", "data_type", tlog.FormatNext("%T"), ev.Data, "event", ev)
-		}
-
-		switch ev.Data.(type) {
-		case *cexio.TickEvent:
-		case *cexio.MarketData:
-		case *cexio.History:
-		case *cexio.OHLCV24:
-		default:
-			panic(fmt.Sprintf("%T", ev.Data))
-		}
-	}
+	printer(ws.Events())
 
 	return nil
 }
@@ -216,19 +200,7 @@ func orderbook(c *cli.Command) (err error) {
 		return errors.Wrap(err, "subscribe")
 	}
 
-	evs := ws.Events()
-
-	for {
-		ev := <-evs
-
-		tlog.Printw("event", "data_type", tlog.FormatNext("%T"), ev.Data, "event", ev)
-
-		switch ev.Data.(type) {
-		case *cexio.MarketDataUpdate:
-		default:
-			panic(fmt.Sprintf("%T", ev.Data))
-		}
-	}
+	printer(ws.Events())
 
 	return nil
 }
@@ -293,11 +265,60 @@ func orderPlace(c *cli.Command) (err error) {
 		return errors.Wrap(err, "request")
 	}
 
-	b := ev.Data.(*cexio.Balance)
+	s := ev.Data.(*cexio.OrderStatus)
 
-	tlog.Printw("place order", "balances", b.Balances, "order_balances", b.OrderBalances, "ts", time.Unix(0, b.Timestamp))
+	tlog.Printw("place order", "status", s)
 
 	return nil
+}
+
+func orderCancel(c *cli.Command) (err error) {
+	cl, err := cexio.New(c.String("key"), []byte(c.String("secret")))
+	if err != nil {
+		return errors.Wrap(err, "new client")
+	}
+
+	ws, err := cl.Websocket(context.Background())
+	if err != nil {
+		return errors.Wrap(err, "open websocket")
+	}
+
+	if c.Args.Len() == 0 {
+		return errors.New("args expected")
+	}
+
+	go printer(ws.Events())
+
+	for _, id := range c.Args {
+		ev, err := ws.CancelOrder(id)
+		if err != nil {
+			return errors.Wrap(err, "request")
+		}
+
+		s := ev.Data.(*cexio.OrderCancelled)
+
+		tlog.Printw("cancel order", "id", id, "status", s)
+	}
+
+	return nil
+}
+
+func printer(evs <-chan cexio.Event) {
+	for {
+		ev := <-evs
+
+		if tlog.If("include") && tlog.If(ev.Event) ||
+			tlog.If("exclude") && !tlog.If(ev.Event) ||
+			!tlog.If("include") && !tlog.If("exclude") {
+			tlog.Printw("event", "event", ev.Event, "data", ev.Data, "data_type", tlog.FormatNext("%T"), ev.Data)
+		}
+
+		switch ev.Data.(type) {
+		case *cexio.MarketDataUpdate:
+		default:
+			//	panic(fmt.Sprintf("%T", ev.Data))
+		}
+	}
 }
 
 func pair(t string) (s1, s2 string) {
